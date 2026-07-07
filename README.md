@@ -45,6 +45,20 @@ Each line in `dataset.jsonl` is a JSON object:
 | `all`    | Search + extract from multiple repos |
 | `tui`    | Interactive questionnaire (asks language, domain, etc.) |
 
+## Repo Sources
+
+| Source   | Description |
+|----------|-------------|
+| `github` | GitHub API search (default). Set `GITHUB_TOKEN` for higher rate limits. |
+| `hf`     | [40M repo metadata dataset](https://huggingface.co/datasets/ibragim-bad/github-repos-metadata-40M) on HuggingFace. Requires `pip install datasets`. No rate limits, fast filtering. |
+
+Use `--source hf` on `search` or `all` commands:
+
+```bash
+python src/repo2dataset.py search --source hf --language rust --min-stars 5000 --limit 10
+python src/repo2dataset.py all --source hf --language python --domain cli --output ./dataset
+```
+
 ## Auth
 
 Set `GITHUB_TOKEN` to increase API rate limits (5000 req/hr vs 60 unauthed):
@@ -57,4 +71,5 @@ export GITHUB_TOKEN="ghp_..."
 
 - Python 3.8+
 - `requests` (for GitHub API)
+- `datasets` (optional, for HuggingFace source)
 - `git` (for cloning repos)

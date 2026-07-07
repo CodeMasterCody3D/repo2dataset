@@ -4,13 +4,17 @@
 Extracts full source code + bug-fix PRs + fix commits + closed issues,
 assembles them into structured (problem→solution→diff) JSONL examples.
 
+Repo discovery sources:
+  - github : GitHub API search (default, needs GITHUB_TOKEN for high limits)
+  - hf     : 40M repo metadata dataset on HuggingFace (pip install datasets)
+
 Usage:
-  python src/repo2dataset.py search --language python --domain web --limit 5
+  python src/repo2dataset.py search --source hf --language python --limit 5
   python src/repo2dataset.py extract --repo gruns/icecream --output ./dataset
-  python src/repo2dataset.py all --language python --domain cli --output ./dataset
+  python src/repo2dataset.py all --source hf --language python --domain cli --output ./dataset
 """
 
-import argparse, json, os, re, subprocess, sys, tempfile, uuid
+import argparse, json, os, re, subprocess, sys
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -33,7 +37,9 @@ def gh_api(path, token=None):
         eprint(f"API error {e.code} for {url}: {e.read().decode()}")
         return None
 
-def search_repos(language, domain=None, min_stars=1000, limit=10, token=None):
+def search_repos(language, domain=None, min_stars=1000, limit=10, source="github", token=None):
+    if source == "hf":
+        return search_repos_hf(language, domain, min_stars, limit)
     q = f"language:{language} stars:>{min_stars}"
     if domain:
         q += f" topic:{domain}"
@@ -49,6 +55,42 @@ def search_repos(language, domain=None, min_stars=1000, limit=10, token=None):
         "open_issues": r["open_issues_count"],
         "pushed_at": r["pushed_at"],
     } for r in data.get("items", [])]
+
+def search_repos_hf(language, domain=None, min_stars=1000, limit=10):
+    """Search repos using the HuggingFace 40M metadata dataset."""
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        eprint("HuggingFace datasets library not installed. Run: pip install datasets")
+        return []
+
+    eprint("Loading repo metadata from HuggingFace (40M dataset)...")
+    ds = load_dataset("ibragim-bad/github-repos-metadata-40M", split="sample", streaming=True)
+
+    results = []
+    for row in ds:
+        lang = (row.get("language") or "").lower()
+        if lang != language.lower():
+            continue
+        stars = row.get("watchers_count") or 0
+        if stars < min_stars:
+            continue
+        name = row.get("repo_name") or ""
+        if not name or "/" not in name:
+            continue
+        results.append({
+            "full_name": name,
+            "stars": stars,
+            "description": row.get("description") or "",
+            "language": row.get("language") or language,
+            "url": f"https://github.com/{name}",
+        })
+        if len(results) >= limit:
+            break
+
+    results.sort(key=lambda r: r["stars"], reverse=True)
+    eprint(f"  Found {len(results)} repos matching {language} >= {min_stars}★")
+    return results
 
 def extract_code(repo, clone_dir, output_file, include_tests=True, max_files=200, token=None):
     """Clone repo and write each source file as a training example."""
@@ -231,7 +273,7 @@ def build_manifest(output_dir, repos, counts):
         json.dump(manifest, f, indent=2)
 
 def cmd_search(args):
-    repos = search_repos(args.language, args.domain, args.min_stars, args.limit)
+    repos = search_repos(args.language, args.domain, args.min_stars, args.limit, args.source)
     if not repos:
         eprint("No repos found.")
         return
@@ -265,7 +307,7 @@ def cmd_extract(args):
     eprint(f"Manifest: {output_dir / 'manifest.json'}")
 
 def cmd_all(args):
-    repos = search_repos(args.language, args.domain, args.min_stars, args.limit)
+    repos = search_repos(args.language, args.domain, args.min_stars, args.limit, args.source)
     if not repos:
         eprint("No repos found with those criteria.")
         return
@@ -310,9 +352,10 @@ def cmd_tui(args):
     do_code = input("Include full source code? (Y/n): ").strip().lower() != "n"
     output = input("Output directory [./dataset]: ").strip() or "./dataset"
 
+    src = input("Repo source [github/hf]: ").strip().lower() or "github"
     token = os.environ.get("GITHUB_TOKEN")
     eprint(f"\nSearching for {lang} repos in '{domain or 'any'} domain'...")
-    repos = search_repos(lang, domain, int(stars), int(count), token)
+    repos = search_repos(lang, domain, int(stars), int(count), src, token)
     if not repos:
         eprint("Nothing found. Try broader criteria.")
         return
@@ -362,6 +405,7 @@ def main():
 
     # search
     sp = sub.add_parser("search", help="Search for repos matching criteria")
+    sp.add_argument("--source", choices=["github", "hf"], default="github", help="Repo source (github API or HuggingFace dataset)")
     sp.add_argument("--language", "-l", default="python", help="Programming language")
     sp.add_argument("--domain", "-d", help="Topic/domain filter")
     sp.add_argument("--min-stars", type=int, default=1000)
@@ -379,6 +423,7 @@ def main():
 
     # all
     ap = sub.add_parser("all", help="Search + extract dataset from multiple repos")
+    ap.add_argument("--source", choices=["github", "hf"], default="github", help="Repo source")
     ap.add_argument("--language", "-l", default="python")
     ap.add_argument("--domain", "-d", help="Topic filter")
     ap.add_argument("--min-stars", type=int, default=1000)

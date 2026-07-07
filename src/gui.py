@@ -70,6 +70,11 @@ class App(tk.Tk):
         self.outdir.grid(row=row, column=1, columnspan=3, sticky="ew", padx=5)
         row += 1
 
+        ttk.Label(f, text="Source:").grid(row=row, column=0, sticky="w")
+        self.source = ttk.Combobox(f, values=["github", "hf"], state="readonly", width=17)
+        self.source.set("github")
+        self.source.grid(row=row, column=1, sticky="ew", padx=5)
+
         # Checkboxes
         cbf = ttk.Frame(f)
         cbf.grid(row=row, column=0, columnspan=4, sticky="w", pady=5)
@@ -126,19 +131,47 @@ class App(tk.Tk):
         domain = self.domain.get().strip()
         stars = self.min_stars.get().strip() or "1000"
         limit = self.max_repos.get().strip() or "5"
+        src = self.source.get() or "github"
 
         def run():
             self.progress.start()
-            self._log(f"Searching {lang} repos (stars>{stars}, domain={domain or 'any'})...")
-            q = f"language:{lang} stars:>{stars}"
-            if domain:
-                q += f" topic:{domain}"
-            data = gh_api(f"/search/repositories?q={q}&sort=stars&per_page={limit}")
-            if data.get("error"):
-                self._log(f"Error: {data['error']}")
-                self.progress.stop()
-                return
-            items = data.get("items", [])
+            self._log(f"Searching {lang} repos (source={src}, stars>{stars})...")
+            items = []
+            if src == "hf":
+                try:
+                    from datasets import load_dataset
+                    self._log("Loading 40M metadata from HuggingFace...")
+                    ds = load_dataset("ibragim-bad/github-repos-metadata-40M", split="sample", streaming=True)
+                    for row in ds:
+                        if (row.get("language") or "").lower() != lang.lower():
+                            continue
+                        if (row.get("watchers_count") or 0) < int(stars):
+                            continue
+                        name = row.get("repo_name") or ""
+                        if not name or "/" not in name:
+                            continue
+                        items.append({
+                            "full_name": name,
+                            "stargazers_count": row.get("watchers_count") or 0,
+                            "description": row.get("description") or "",
+                        })
+                        if len(items) >= int(limit):
+                            break
+                    items.sort(key=lambda r: r["stargazers_count"], reverse=True)
+                except ImportError:
+                    self._log("HuggingFace datasets not installed. Run: pip install datasets")
+                    self.progress.stop()
+                    return
+            else:
+                q = f"language:{lang} stars:>{stars}"
+                if domain:
+                    q += f" topic:{domain}"
+                data = gh_api(f"/search/repositories?q={q}&sort=stars&per_page={limit}")
+                if data.get("error"):
+                    self._log(f"Error: {data['error']}")
+                    self.progress.stop()
+                    return
+                items = data.get("items", [])
             if not items:
                 self._log("No repos found. Try broader criteria.")
                 self.progress.stop()
