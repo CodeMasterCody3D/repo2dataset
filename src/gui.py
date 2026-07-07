@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tkinter GUI for repo2dataset."""
 
-import json, os, threading, subprocess, tempfile
+import json, os, threading, subprocess
 from pathlib import Path
 from tkinter import ttk, messagebox, scrolledtext
 import tkinter as tk
@@ -9,6 +9,7 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
 GITHUB_API = "https://api.github.com"
+HF_API = "https://huggingface.co/api"
 CONFIG = {"token": os.environ.get("GITHUB_TOKEN", "")}
 
 def gh_api(path):
@@ -29,17 +30,150 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("repo2dataset")
-        self.geometry("800x700")
+        self.geometry("900x750")
 
         self.repos = []
         self.selected_repos = []
         self.output_dir = Path("./dataset")
 
-        self._build_widgets()
+        # Notebook with tabs
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True)
 
-    def _build_widgets(self):
+        self.build_tab = ttk.Frame(self.nb)
+        self.hf_tab = ttk.Frame(self.nb)
+        self.nb.add(self.build_tab, text="Build Dataset")
+        self.nb.add(self.hf_tab, text="HF Datasets")
+
+        self._build_dataset_tab()
+        self._build_hf_tab()
+
+    def _build_hf_tab(self):
+        f = ttk.Frame(self.hf_tab, padding=10)
+        f.pack(fill="x")
+
+        row = 0
+        ttk.Label(f, text="Search:").grid(row=row, column=0, sticky="w")
+        self.hf_query = ttk.Entry(f, width=50)
+        self.hf_query.grid(row=row, column=1, sticky="ew", padx=5)
+
+        ttk.Label(f, text="Task:").grid(row=row, column=2, sticky="w", padx=(10,0))
+        self.hf_task = ttk.Combobox(f, values=["", "text-classification", "text-generation",
+            "image-classification", "object-detection", "summarization", "translation"],
+            state="readonly", width=22)
+        self.hf_task.set("")
+        self.hf_task.grid(row=row, column=3, sticky="ew", padx=5)
+        row += 1
+
+        bf = ttk.Frame(f)
+        bf.grid(row=row, column=0, columnspan=4, pady=5)
+        ttk.Button(bf, text="Search Datasets", command=self._hf_search).pack(side="left", padx=2)
+        self.hf_dl_btn = ttk.Button(bf, text="Download Selected", command=self._hf_download, state="disabled")
+        self.hf_dl_btn.pack(side="left", padx=2)
+
+        # Results
+        ttk.Label(self.hf_tab, text="Datasets (click to select):").pack(anchor="w", padx=10)
+        rlf = ttk.Frame(self.hf_tab)
+        rlf.pack(fill="both", expand=True, padx=10)
+        scroll = ttk.Scrollbar(rlf)
+        scroll.pack(side="right", fill="y")
+        self.hf_list = tk.Listbox(rlf, yscrollcommand=scroll.set)
+        self.hf_list.pack(side="left", fill="both", expand=True)
+        scroll.config(command=self.hf_list.yview)
+
+        self.hf_datasets = []
+
+        # Log
+        ttk.Label(self.hf_tab, text="Log:").pack(anchor="w", padx=10)
+        self.hf_log = scrolledtext.ScrolledText(self.hf_tab, height=8, state="disabled")
+        self.hf_log.pack(fill="x", padx=10, pady=5)
+
+        self.hf_progress = ttk.Progressbar(self.hf_tab, mode="indeterminate")
+        self.hf_progress.pack(fill="x", padx=10)
+
+    def _hf_log(self, msg):
+        self.hf_log.configure(state="normal")
+        self.hf_log.insert("end", msg + "\n")
+        self.hf_log.see("end")
+        self.hf_log.configure(state="disabled")
+        self.update_idletasks()
+
+    def _hf_search(self):
+        self.hf_list.delete(0, "end")
+        self.hf_datasets = []
+        self.hf_dl_btn.configure(state="disabled")
+        q = self.hf_query.get().strip()
+        task = self.hf_task.get() or None
+
+        def run():
+            self.hf_progress.start()
+            self._hf_log(f"Searching HF datasets (query='{q}', task={task or 'any'})...")
+            params = f"search={q}&sort=downloads&direction=-1&limit=50"
+            if task:
+                params += f"&filter={task}"
+            try:
+                with urlopen(Request(f"{HF_API}/datasets?{params}", headers={"User-Agent": "repo2dataset"}), timeout=15) as r:
+                    results = json.loads(r.read())
+            except Exception as e:
+                self._hf_log(f"Error: {e}")
+                self.hf_progress.stop()
+                return
+            if not results:
+                self._hf_log("No datasets found.")
+                self.hf_progress.stop()
+                return
+            for ds in results:
+                d = ds.get("cardData") or {}
+                desc = (d.get("description", "") or "")[:90]
+                tags = ", ".join(ds.get("tags", [])[:3])
+                label = f"{ds['id']:45s} {ds.get('downloads', 0):>10,}↓  {tags:25s}  {desc}"
+                self.hf_datasets.append(ds)
+                self.hf_list.insert("end", label)
+            self._hf_log(f"Found {len(results)} datasets. Select one and click Download.")
+            self.hf_dl_btn.configure(state="normal")
+            self.hf_progress.stop()
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _hf_download(self):
+        sel = self.hf_list.curselection()
+        if not sel:
+            return
+        ds = self.hf_datasets[sel[0]]
+        name = ds["id"]
+
+        def run():
+            self.hf_progress.start()
+            self.hf_dl_btn.configure(state="disabled")
+            self._hf_log(f"Downloading {name}...")
+            try:
+                from datasets import load_dataset
+            except ImportError:
+                self._hf_log("Need datasets library. Run: pip install datasets")
+                self.hf_progress.stop()
+                self.hf_dl_btn.configure(state="normal")
+                return
+            spl = "train"
+            try:
+                data = load_dataset(name, split=spl, streaming=True)
+                out = Path(f"./hf-datasets/{name.replace('/', '_')}")
+                out.mkdir(parents=True, exist_ok=True)
+                fout = out / f"{spl}.jsonl"
+                count = 0
+                for row in data:
+                    fout.open("a").write(json.dumps(row, default=str) + "\n")
+                    count += 1
+                self._hf_log(f"Saved {count} rows to {fout}")
+            except Exception as e:
+                self._hf_log(f"Error: {e}")
+            self.hf_progress.stop()
+            self.hf_dl_btn.configure(state="normal")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _build_dataset_tab(self):
         # -- Input frame --
-        f = ttk.LabelFrame(self, text="Search Criteria", padding=10)
+        f = ttk.LabelFrame(self.build_tab, text="Search Criteria", padding=10)
         f.pack(fill="x", padx=10, pady=5)
 
         row = 0
@@ -88,7 +222,7 @@ class App(tk.Tk):
         ttk.Checkbutton(cbf, text="Fix commits", variable=self.include_commits).pack(side="left", padx=5)
 
         # Buttons
-        bf = ttk.Frame(self)
+        bf = ttk.Frame(self.build_tab)
         bf.pack(fill="x", padx=10, pady=5)
         ttk.Button(bf, text="Search Repos", command=self._search).pack(side="left", padx=2)
         self.extract_btn = ttk.Button(bf, text="Build Dataset", command=self._extract, state="disabled")
@@ -97,8 +231,8 @@ class App(tk.Tk):
         ttk.Button(bf, text="Open Output", command=self._open_output).pack(side="left", padx=2)
 
         # Repo list
-        ttk.Label(self, text="Repos (click to select/deselect):").pack(anchor="w", padx=10)
-        rlf = ttk.Frame(self)
+        ttk.Label(self.build_tab, text="Repos (click to select/deselect):").pack(anchor="w", padx=10)
+        rlf = ttk.Frame(self.build_tab)
         rlf.pack(fill="both", expand=True, padx=10, pady=2)
         scroll = ttk.Scrollbar(rlf)
         scroll.pack(side="right", fill="y")
@@ -107,12 +241,12 @@ class App(tk.Tk):
         scroll.config(command=self.repo_list.yview)
 
         # Status / log
-        ttk.Label(self, text="Log:").pack(anchor="w", padx=10)
-        self.log = scrolledtext.ScrolledText(self, height=10, state="disabled")
+        ttk.Label(self.build_tab, text="Log:").pack(anchor="w", padx=10)
+        self.log = scrolledtext.ScrolledText(self.build_tab, height=10, state="disabled")
         self.log.pack(fill="both", padx=10, pady=5)
 
         # Progress
-        self.progress = ttk.Progressbar(self, mode="indeterminate")
+        self.progress = ttk.Progressbar(self.build_tab, mode="indeterminate")
         self.progress.pack(fill="x", padx=10, pady=2)
 
     def _log(self, msg):

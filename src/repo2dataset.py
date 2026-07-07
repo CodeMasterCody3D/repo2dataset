@@ -14,7 +14,7 @@ Usage:
   python src/repo2dataset.py all --source hf --language python --domain cli --output ./dataset
 """
 
-import argparse, json, os, re, subprocess, sys
+import argparse, json, os, re, subprocess, sys, textwrap
 from pathlib import Path
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -272,6 +272,69 @@ def build_manifest(output_dir, repos, counts):
     with open(Path(output_dir) / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
 
+HF_API = "https://huggingface.co/api"
+
+def hf_search_datasets(query="", task=None, limit=20):
+    """Search HuggingFace datasets."""
+    params = f"search={query}&sort=downloads&direction=-1&limit={limit}"
+    if task:
+        params += f"&filter={task}"
+    url = f"{HF_API}/datasets?{params}"
+    try:
+        with urlopen(Request(url, headers={"User-Agent": "repo2dataset"}), timeout=15) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        eprint(f"HF API error: {e}")
+        return []
+
+def hf_download_dataset(name, split="train", output_dir="."):
+    """Download a HuggingFace dataset to disk (uses datasets library)."""
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        eprint("Need datasets library. Run: pip install datasets")
+        return
+    eprint(f"Downloading {name} (split={split})...")
+    ds = load_dataset(name, split=split)
+    out = Path(output_dir) / name.replace("/", "_")
+    out.mkdir(parents=True, exist_ok=True)
+    fout = out / f"{split}.jsonl"
+    for row in ds:
+        fout.open("a").write(json.dumps(row, default=str) + "\n")
+    eprint(f"Saved {len(ds)} rows to {fout}")
+
+def cmd_hf(args):
+    if args.hf_cmd == "search":
+        results = hf_search_datasets(args.query, args.task, args.limit)
+        if not results:
+            eprint("No datasets found.")
+            return
+        for ds in results:
+            d = ds.get("cardData") or {}
+            desc = d.get("description", "") or ""
+            if len(desc) > 120:
+                desc = desc[:117] + "..."
+            tags = ", ".join(ds.get("tags", [])[:4])
+            print(f"{ds['id']:50s} {ds.get('downloads', 0):>8,}↓  {tags:30s}  {desc}")
+    elif args.hf_cmd == "download":
+        hf_download_dataset(args.name, args.split, args.output)
+    elif args.hf_cmd == "info":
+        url = f"{HF_API}/datasets/{args.name}"
+        try:
+            with urlopen(Request(url, headers={"User-Agent": "repo2dataset"}), timeout=15) as r:
+                ds = json.loads(r.read())
+        except Exception as e:
+            eprint(f"Error: {e}")
+            return
+        d = ds.get("cardData") or {}
+        print(f"Name:        {ds['id']}")
+        print(f"Downloads:   {ds.get('downloads', 0):,}")
+        print(f"Likes:       {ds.get('likes', 0):,}")
+        print(f"Tags:        {', '.join(ds.get('tags', []))}")
+        print(f"Description: {d.get('description', 'N/A')}")
+        print(f"Configs:     {', '.join(d.get('configs', []))}")
+        print(f"License:     {d.get('license', 'N/A')}")
+
 def cmd_search(args):
     repos = search_repos(args.language, args.domain, args.min_stars, args.limit, args.source)
     if not repos:
@@ -344,6 +407,35 @@ def cmd_all(args):
 def cmd_tui(args):
     """Simple interactive TUI."""
     print("\n=== repo2dataset Interactive ===\n")
+    mode = input("Mode [build-dataset / browse-hf / quit]: ").strip() or "build-dataset"
+
+    if mode == "browse-hf":
+        while True:
+            q = input("\nSearch HuggingFace datasets (or Enter to list popular, 'q' to quit): ").strip()
+            if q.lower() == "q":
+                break
+            limit = int(input("Results per page [20]: ").strip() or "20")
+            results = hf_search_datasets(q, limit=limit)
+            if not results:
+                print("No results.")
+                continue
+            print(f"\n{'Dataset':50s} {'Downloads':>8s}  {'Tags':30s}  Description")
+            print("-" * 120)
+            pages = [results[i:i+20] for i in range(0, len(results), 20)]
+            for page in pages:
+                for ds in page:
+                    d = ds.get("cardData") or {}
+                    desc = (d.get("description", "") or "")[:80]
+                    tags = ", ".join(ds.get("tags", [])[:3])
+                    print(f"{ds['id']:50s} {ds.get('downloads', 0):>8,}↓  {tags:30s}  {desc}")
+                pick = input("\nEnter dataset name to download, or press Enter for more: ").strip()
+                if pick:
+                    spl = input("Split [train]: ").strip() or "train"
+                    out = input("Output dir [./hf-datasets]: ").strip() or "./hf-datasets"
+                    hf_download_dataset(pick, spl, out)
+                    break
+        return
+
     lang = input("Programming language [Python]: ").strip() or "Python"
     domain = input("Domain (web/cli/data-science/etc) []: ").strip() or ""
     stars = input("Min stars [1000]: ").strip() or "1000"
@@ -438,6 +530,20 @@ def main():
     # tui
     sub.add_parser("tui", help="Interactive mode (asks questions)")
 
+    # hf
+    hp = sub.add_parser("hf", help="HuggingFace dataset operations")
+    hfs = hp.add_subparsers(dest="hf_cmd")
+    hf_search = hfs.add_parser("search", help="Search HuggingFace datasets")
+    hf_search.add_argument("--query", "-q", default="", help="Search query")
+    hf_search.add_argument("--task", help="Filter by task (e.g. text-classification)")
+    hf_search.add_argument("--limit", "-l", type=int, default=20)
+    hf_dl = hfs.add_parser("download", help="Download a HuggingFace dataset")
+    hf_dl.add_argument("--name", "-n", required=True, help="Dataset name (e.g. ibragim-bad/github-repos-metadata-40M)")
+    hf_dl.add_argument("--split", "-s", default="train", help="Dataset split")
+    hf_dl.add_argument("--output", "-o", default="./hf-datasets", help="Output directory")
+    hf_info = hfs.add_parser("info", help="Show dataset info")
+    hf_info.add_argument("name", help="Dataset name")
+
     args = p.parse_args()
     if not args.cmd:
         p.print_help()
@@ -454,6 +560,8 @@ def main():
         cmd_all(args)
     elif args.cmd == "tui":
         cmd_tui(args)
+    elif args.cmd == "hf":
+        cmd_hf(args)
 
 if __name__ == "__main__":
     main()
